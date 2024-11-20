@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -14,111 +13,50 @@ func main() {
 	if len(os.Args) < 2 {
 		log.Fatalf("usage: %s <command> [args...]", os.Args[0])
 	}
-	command := os.Args[1]
-	args := os.Args[2:]
-
-	switch command {
+	switch os.Args[1] {
 	case "run":
-		run(args)
+		run(os.Args[2:])
 	case "child":
-		child(args)
+		child(os.Args[2:])
 	default:
-		log.Fatalf("Unknown command: %s", command)
+		log.Fatalf("Unknown command: %s", os.Args[1])
 	}
 }
 
-// run sets up the initial environment and starts a new process in isolated namespaces.
 func run(args []string) {
 	cmd := exec.Command("/proc/self/exe", append([]string{"child"}, args...)...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Cloneflags: syscall.CLONE_NEWUTS |
-			syscall.CLONE_NEWPID |
-			syscall.CLONE_NEWNS |
-			syscall.CLONE_NEWNET |
-			syscall.CLONE_NEWIPC,
+	cmd.Stdin, cmd.Stdout, cmd.Stderr, cmd.SysProcAttr = os.Stdin, os.Stdout, os.Stderr, &syscall.SysProcAttr{
+		Cloneflags: syscall.CLONE_NEWUTS | syscall.CLONE_NEWPID | syscall.CLONE_NEWNS | syscall.CLONE_NEWNET | syscall.CLONE_NEWIPC,
 	}
-
-	if err := cmd.Start(); err != nil {
-		log.Fatalf("Error starting command: %v", err)
+	if err := cmd.Start(); err != nil || setupCgroups(cmd.Process.Pid) != nil {
+		log.Fatalf("Error: %v", err)
 	}
-
-	// Setup cgroups for the new process
-	if err := setupCgroups(cmd.Process.Pid); err != nil {
-		log.Fatalf("Error setting up cgroups: %v", err)
-	}
-
 	cmd.Wait()
 }
 
-// child is the function that runs in the isolated namespace.
 func child(args []string) {
-	// Set hostname in the new UTS namespace
-	if err := syscall.Sethostname([]byte("container-hostname")); err != nil {
-		log.Fatalf("Error setting hostname: %v", err)
+	if err := syscall.Sethostname([]byte("container-hostname")); err != nil ||
+		syscall.Chroot("/path/to/new/root") != nil || os.Chdir("/") != nil ||
+		syscall.Mount("proc", "/proc", "proc", 0, "") != nil {
+		log.Fatalf("Error setting up child environment")
 	}
-
-	// Setup chroot for filesystem isolation
-	if err := syscall.Chroot("/path/to/new/root"); err != nil {
-		log.Fatalf("Error with chroot: %v", err)
-	}
-	if err := os.Chdir("/"); err != nil {
-		log.Fatalf("Error changing directory: %v", err)
-	}
-
-	// Mount proc filesystem
-	if err := syscall.Mount("proc", "/proc", "proc", 0, ""); err != nil {
-		log.Fatalf("Error mounting /proc: %v", err)
-	}
-
-	// Execute the desired command
 	cmd := exec.Command(args[0], args[1:]...)
-	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-
-	if err := cmd.Run(); err != nil {
-		log.Fatalf("Error running command in child: %v", err)
-	}
-
-	// Unmount proc filesystem when done
-	if err := syscall.Unmount("/proc", 0); err != nil {
-		log.Fatalf("Error unmounting /proc: %v", err)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Run(); err != nil || syscall.Unmount("/proc", 0) != nil {
+		log.Fatalf("Error running command in child")
 	}
 }
 
-// setupCgroups sets up cgroups to limit resources for the containerized process.
 func setupCgroups(pid int) error {
-	cgroupPath := "/sys/fs/cgroup/"
-	cpu := filepath.Join(cgroupPath, "cpu", "mycontainer")
-	mem := filepath.Join(cgroupPath, "memory", "mycontainer")
-
-	// Create cgroup directories
-	if err := os.MkdirAll(cpu, 0755); err != nil {
-		return err
+	for _, group := range []struct {
+		path, param, value string
+	}{{"/sys/fs/cgroup/cpu/mycontainer", "cpu.cfs_quota_us", "50000"},
+		{"/sys/fs/cgroup/memory/mycontainer", "memory.limit_in_bytes", "100000000"}} {
+		if err := os.MkdirAll(group.path, 0755); err != nil ||
+			os.WriteFile(filepath.Join(group.path, group.param), []byte(group.value), 0644) != nil ||
+			os.WriteFile(filepath.Join(group.path, "tasks"), []byte(strconv.Itoa(pid)), 0644) != nil {
+			return err
+		}
 	}
-	if err := os.MkdirAll(mem, 0755); err != nil {
-		return err
-	}
-
-	// Set CPU and memory limits
-	if err := os.WriteFile(filepath.Join(cpu, "cpu.cfs_quota_us"), []byte("50000"), 0644); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(mem, "memory.limit_in_bytes"), []byte("100000000"), 0644); err != nil {
-		return err
-	}
-
-	// Add the process to the cgroup
-	if err := os.WriteFile(filepath.Join(cpu, "tasks"), []byte(strconv.Itoa(pid)), 0644); err != nil {
-		return err
-	}
-	if err := os.WriteFile(filepath.Join(mem, "tasks"), []byte(strconv.Itoa(pid)), 0644); err != nil {
-		return err
-	}
-
 	return nil
 }
