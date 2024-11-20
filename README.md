@@ -11,7 +11,7 @@ Key goal: It should be able to run a service inside an isolated "environment" vi
 
 ```bash
 # In the project root file
-container_test.go
+go test -v container_test.go
 ```
 ### Explanation:
     TestRunCommand: Tests the run command by executing a simple echo command.
